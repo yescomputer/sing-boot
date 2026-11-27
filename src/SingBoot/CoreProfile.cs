@@ -83,7 +83,7 @@ public sealed class CoreStartRequest
 
 internal static class CoreDiscovery
 {
-    private const string SingBoxExecutableName = "sing-box.exe";
+    internal const string SingBoxExecutableName = "sing-box.exe";
     private const string SingBoxConfigName = "config.json";
 
     public static string GetConfigPath(string baseDirectory)
@@ -91,14 +91,19 @@ internal static class CoreDiscovery
         return Path.Combine(Path.GetFullPath(baseDirectory), SingBoxConfigName);
     }
 
-    public static bool TryDiscover(string baseDirectory, out CoreProfile? profile, out string message)
+    public static CoreProfile GetLayout(string baseDirectory)
     {
         var directory = Path.GetFullPath(baseDirectory);
-        var singBoxExe = Path.Combine(directory, SingBoxExecutableName);
-        var singBoxConfig = Path.Combine(directory, SingBoxConfigName);
-        if (File.Exists(singBoxExe) && File.Exists(singBoxConfig))
+        return new CoreProfile("sing-box", Path.Combine(directory, SingBoxExecutableName),
+            Path.Combine(directory, SingBoxConfigName), directory);
+    }
+
+    public static bool TryDiscover(string baseDirectory, out CoreProfile? profile, out string message)
+    {
+        var layout = GetLayout(baseDirectory);
+        if (File.Exists(layout.ExecutablePath) && File.Exists(layout.ConfigPath))
         {
-            profile = new CoreProfile("sing-box", singBoxExe, singBoxConfig, directory);
+            profile = layout;
             message = "";
             return true;
         }

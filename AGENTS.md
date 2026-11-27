@@ -16,6 +16,7 @@ sing-boot 是一个 Windows 系统托盘工具，用于在后台运行和控制 
 - sing-box 配置通过 stdin 管道传递给 `sing-box run -c stdin`
 - 支持 JSONC 配置文件（允许注释和尾随逗号）
 - 支持通过托盘菜单按 `sing-boot.json` 拉取远程配置、备份 `config.json.bak`，并在核心运行时自动重启 sing-box
+- 支持通过托盘菜单从 GitHub 更新 sing-box 稳定版，备份被替换的程序文件并恢复更新前的运行状态
 - 自动保存核心 stdout 和 stderr 日志（按天追加）
 
 ---
@@ -35,6 +36,9 @@ sing-boot/
 │   │   ├── CoreConfig.cs         # JSON 配置加载与 TUN 检测
 │   │   ├── SingBootSettings.cs   # sing-boot.json 配置加载与校验
 │   │   ├── RemoteConfigUpdater.cs # 远程配置拉取、校验与备份替换
+│   │   ├── CoreBinaryUpdater.cs   # 官方发布包选择、下载和版本校验
+│   │   ├── CoreUpdatePackage.cs   # 核心程序和配套 DLL 的暂存、备份、替换与恢复
+│   │   ├── UpdateHttpClient.cs    # 配置更新与核心更新共用的 HTTP 客户端设置
 │   │   ├── MainForm.cs           # 托盘 UI 窗体
 │   │   ├── JsonHelper.cs         # JSONC 规范化工具
 │   │   ├── NetworkReadiness.cs   # 开机自启网络就绪检查
@@ -114,8 +118,8 @@ Stopped → Starting → Running → Stopping → Stopped
 
 **UI 元素**:
 - 托盘图标（运行中/已停止两种状态）
-- 右键菜单: Start/Stop、Update config、Auto-start、Quit
-- 气泡通知（错误提示与手动配置更新反馈）
+- 右键菜单包含 Start/Stop、Update config、Update sing-box、Auto-start 和 Quit
+- 气泡通知显示更新结果和错误信息
 
 **事件处理**:
 - 左键点击: 切换启动/停止
@@ -139,6 +143,12 @@ Stopped → Starting → Running → Stopping → Stopped
 - `RemoteConfigUpdater` 通过 HTTPS/HTTP 拉取配置（单次请求，30 秒超时），先校验 JSON/JSONC 合法性，再将原 `config.json` 原子备份为 `config.json.bak` 并写入新的 `config.json`
 - 停止核心、启动核心或退出程序会取消正在进行的下载；诊断日志记录底层网络异常，URL 仅保留协议、主机和端口，嵌套 JSON 解析错误不记录原始配置片段
 - 若当前核心处于停止状态则仅保存新配置；若正在运行则调用 `SingBootApp.Restart()` 重启一次 `sing-box`（若新配置新增了 TUN 且当前未提权，则通过 `--handoff-start` 提权重启）
+
+### CoreBinaryUpdater.cs / CoreUpdatePackage.cs - 核心更新
+
+「Update sing-box」查询 SagerNet/sing-box 的最新稳定发布，按完整文件名选择标准 Windows x64 ZIP。下载到部署目录的临时子目录后，先验证 GitHub 发布的 SHA-256，再检查暂存核心的 `version` 输出。
+
+`CoreSupervisor` 在线程队列中执行停核、替换、重启和失败恢复。每个被替换的运行文件都有同名 `.bak` 备份。此前正在运行的核心沿用已加载的配置，启动宽限期通过后才报告更新成功。更新操作与托盘的启停及配置更新互斥。
 
 ### JsonHelper.cs - JSONC 规范化
 

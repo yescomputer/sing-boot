@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net.Http;
 
 namespace SingBoot;
 
@@ -134,6 +135,20 @@ internal sealed class SingBootApp : IDisposable
         CancellationToken cancellationToken)
     {
         return RemoteConfigUpdater.FetchAsync(configUrl, _remoteDownloader, cancellationToken);
+    }
+
+    public async Task<string> UpdateCoreAsync(CancellationToken token, HttpMessageHandler? handler = null)
+    {
+        var result = await CoreBinaryUpdater.UpdateAsync(_baseDirectory, (package, cancellation) =>
+        {
+            if (HasConflictingCoreProcess(out var message, updatingExecutable: true))
+                throw new InvalidOperationException(message);
+            var startRequest = _config is null ? null : _profile?.CreateStartRequest(_config);
+            return _supervisor.InstallUpdateAsync(package, startRequest, cancellation);
+        }, handler, token).ConfigureAwait(false);
+        if (_profile is null && CoreDiscovery.TryDiscover(_baseDirectory, out var discovered, out _))
+            _profile = discovered;
+        return result;
     }
 
     public bool ApplyRemoteConfigOnly(DownloadedCoreConfig downloadedConfig, out string message)
@@ -337,19 +352,22 @@ internal sealed class SingBootApp : IDisposable
         }
     }
 
-    private bool HasConflictingCoreProcess(out string message)
+    private bool HasConflictingCoreProcess(out string message, bool updatingExecutable = false)
     {
-        if (_profile is null)
+        var profile = _profile ?? (updatingExecutable ? CoreDiscovery.GetLayout(_baseDirectory) : null);
+        if (profile is null || (updatingExecutable && !File.Exists(profile.ExecutablePath)))
         {
             message = "";
             return false;
         }
 
+        var action = updatingExecutable ? "updating its executable" : "starting from the tray";
+        var conflictMessage = $"Another {profile.DisplayName} process is already running. Stop it before {action}.";
         if (_conflictDetector is not null)
         {
-            if (_conflictDetector(_profile, _supervisor.ProcessId))
+            if (_conflictDetector(profile, _supervisor.ProcessId))
             {
-                message = $"Another {_profile.DisplayName} process is already running. Stop it before starting from the tray.";
+                message = conflictMessage;
                 return true;
             }
 
@@ -357,7 +375,7 @@ internal sealed class SingBootApp : IDisposable
             return false;
         }
 
-        foreach (var process in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(_profile.ExecutablePath)))
+        foreach (var process in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(profile.ExecutablePath)))
         {
             using (process)
             {
@@ -374,7 +392,24 @@ internal sealed class SingBootApp : IDisposable
                 if (_supervisor.ProcessId != 0 && process.Id == (int)_supervisor.ProcessId)
                     continue;
 
-                message = $"Another {_profile.DisplayName} process is already running. Stop it before starting from the tray.";
+                if (updatingExecutable)
+                {
+                    try
+                    {
+                        if (!string.Equals(process.MainModule.FileName, profile.ExecutablePath, StringComparison.OrdinalIgnoreCase))
+                            continue;
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        continue; // The process exited during inspection.
+                    }
+                    catch (System.ComponentModel.Win32Exception)
+                    {
+                        // If Windows denies inspection, the process may be using this executable.
+                    }
+                }
+
+                message = conflictMessage;
                 return true;
             }
         }

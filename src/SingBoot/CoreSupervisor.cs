@@ -50,7 +50,7 @@ public sealed class CoreSupervisor : IDisposable
     private static readonly Regex AnsiEscapeRegex = new(@"\x1B\[[0-9;]*[A-Za-z]", RegexOptions.Compiled);
 
     private readonly int _startupGracePeriodMs;
-    private readonly BlockingCollection<SupervisorCommand> _queue = new();
+    private readonly BlockingCollection<(Action Execute, TaskCompletionSource<bool>? Completion)> _queue = new();
     private readonly Thread _thread;
     private readonly object _stderrLock = new();
     private readonly Queue<string> _stderrLines = new();
@@ -61,7 +61,8 @@ public sealed class CoreSupervisor : IDisposable
     private Thread? _stdoutLogReaderThread;
     private Thread? _stderrReaderThread;
     private DateTime _startupDeadlineUtc = DateTime.MinValue;
-    private CoreState _state = CoreState.Stopped;
+    private volatile CoreState _state = CoreState.Stopped;
+    private string _stateMessage = "";
     private string _currentCoreDisplayName = "core";
     private bool _disposed;
     private int _commandPending;
@@ -86,12 +87,20 @@ public sealed class CoreSupervisor : IDisposable
 
     public bool RequestStart(CoreStartRequest startRequest)
     {
-        return TryQueueCommand(new SupervisorCommand(CommandKind.Start, startRequest));
+        return TryQueueCommand(() => DoStart(startRequest));
     }
 
     public bool RequestStop()
     {
-        return TryQueueCommand(new SupervisorCommand(CommandKind.Stop, null));
+        return TryQueueCommand(() => DoStopGraceful());
+    }
+
+    internal Task InstallUpdateAsync(CoreUpdatePackage package, CoreStartRequest? startRequest, CancellationToken token)
+    {
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!TryQueueCommand(() => InstallUpdate(package, startRequest, token), completion))
+            throw new InvalidOperationException("Another core operation is pending or sing-boot is closing.");
+        return completion.Task;
     }
 
     /// <summary>
@@ -121,26 +130,33 @@ public sealed class CoreSupervisor : IDisposable
     {
         try
         {
-            while (Volatile.Read(ref _shutdownRequested) == 0)
+            while (!_queue.IsCompleted)
             {
                 CheckProcessStatus();
 
                 if (_queue.TryTake(out var cmd, millisecondsTimeout: 200))
                 {
-                    if (Volatile.Read(ref _shutdownRequested) != 0)
-                    {
-                        Interlocked.Exchange(ref _commandPending, 0);
-                        break;
-                    }
-
+                    var shuttingDown = Volatile.Read(ref _shutdownRequested) != 0;
+                    Exception? failure = null;
                     try
                     {
-                        HandleCommand(cmd);
+                        if (!shuttingDown)
+                            cmd.Execute();
+                    }
+                    catch (Exception ex) when (cmd.Completion is not null)
+                    {
+                        failure = ex;
                     }
                     finally
                     {
                         Interlocked.Exchange(ref _commandPending, 0);
                     }
+                    if (shuttingDown || failure is OperationCanceledException)
+                        cmd.Completion?.SetCanceled();
+                    else if (failure is not null)
+                        cmd.Completion?.SetException(failure);
+                    else
+                        cmd.Completion?.SetResult(true);
                 }
             }
         }
@@ -150,7 +166,7 @@ public sealed class CoreSupervisor : IDisposable
         DoStopGraceful();
     }
 
-    private bool TryQueueCommand(SupervisorCommand command)
+    private bool TryQueueCommand(Action execute, TaskCompletionSource<bool>? completion = null)
     {
         if (Volatile.Read(ref _shutdownRequested) != 0 ||
             Interlocked.CompareExchange(ref _commandPending, 1, 0) != 0)
@@ -160,7 +176,7 @@ public sealed class CoreSupervisor : IDisposable
 
         try
         {
-            if (_queue.TryAdd(command))
+            if (_queue.TryAdd((execute, completion)))
                 return true;
         }
         catch (ObjectDisposedException)
@@ -188,18 +204,64 @@ public sealed class CoreSupervisor : IDisposable
         }
     }
 
-    private void HandleCommand(SupervisorCommand cmd)
+    private void InstallUpdate(CoreUpdatePackage package, CoreStartRequest? startRequest, CancellationToken token)
     {
-        switch (cmd.Kind)
+        ThrowIfUpdateCancelled(token);
+        var restart = _state == CoreState.Running;
+        if (_state is CoreState.Starting or CoreState.Stopping || (restart && startRequest is null))
+            throw new InvalidOperationException("The core is not ready for an update.");
+
+        if (restart)
+            DoStopGraceful();
+        try
         {
-            case CommandKind.Start:
-                if (cmd.StartRequest is not null)
-                    DoStart(cmd.StartRequest);
-                break;
-            case CommandKind.Stop:
-                DoStopGraceful();
-                break;
+            ThrowIfUpdateCancelled(token);
+            package.Install();
+            if (restart)
+                StartAndWaitForRunning(startRequest!, token);
+            ThrowIfUpdateCancelled(token);
         }
+        catch (Exception updateError)
+        {
+            DoStopGraceful();
+            try
+            {
+                package.Rollback();
+                if (restart && !token.IsCancellationRequested && Volatile.Read(ref _shutdownRequested) == 0)
+                    StartAndWaitForRunning(startRequest!, token);
+            }
+            catch (Exception recoveryError) when (recoveryError is not OperationCanceledException)
+            {
+                throw new IOException($"Update failed: {updateError.Message} Recovery failed: {recoveryError.Message}", recoveryError);
+            }
+            if (updateError is OperationCanceledException)
+                throw;
+            ThrowIfUpdateCancelled(token);
+            var recovery = restart ? "Previous sing-box restored and restarted." : "Previous files restored.";
+            throw new IOException($"{updateError.Message} {recovery}", updateError);
+        }
+    }
+
+    private void StartAndWaitForRunning(CoreStartRequest request, CancellationToken token)
+    {
+        ThrowIfUpdateCancelled(token);
+        DoStart(request);
+        while (_state == CoreState.Starting)
+        {
+            ThrowIfUpdateCancelled(token);
+            CheckProcessStatus();
+            if (_state == CoreState.Starting)
+                Thread.Sleep(50);
+        }
+        if (_state != CoreState.Running)
+            throw new InvalidOperationException(_stateMessage);
+    }
+
+    private void ThrowIfUpdateCancelled(CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        if (Volatile.Read(ref _shutdownRequested) != 0)
+            throw new OperationCanceledException("sing-boot is closing.");
     }
 
     private void DoStart(CoreStartRequest request)
@@ -807,6 +869,7 @@ public sealed class CoreSupervisor : IDisposable
     private void SetStateAndNotify(CoreState state, string message = "")
     {
         _state = state;
+        _stateMessage = message;
         RaiseEvent(new CoreEvent(CoreEventKind.StateChanged, state, message));
     }
 
@@ -820,24 +883,6 @@ public sealed class CoreSupervisor : IDisposable
             ctx.Post(_ => handler(evt), null);
         else
             handler(evt);
-    }
-
-    private enum CommandKind
-    {
-        Start,
-        Stop
-    }
-
-    private readonly struct SupervisorCommand
-    {
-        public CommandKind Kind { get; }
-        public CoreStartRequest? StartRequest { get; }
-
-        public SupervisorCommand(CommandKind kind, CoreStartRequest? startRequest)
-        {
-            Kind = kind;
-            StartRequest = startRequest;
-        }
     }
 
     private sealed class CoreLogContext

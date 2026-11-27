@@ -26,10 +26,10 @@ internal sealed class MainForm : Form
     private readonly NotifyIcon _trayIcon;
     private readonly ToolStripMenuItem _miStartStop;
     private readonly ToolStripMenuItem _miUpdateConfig;
+    private readonly ToolStripMenuItem _miUpdateCore;
     private readonly ToolStripMenuItem _miAutoStart;
     private readonly Icon _iconRunning;
     private readonly Icon _iconStopped;
-    private readonly bool _startCoreAfterLaunch;
     private readonly bool _waitForDefaultGatewayBeforeStart;
     private CancellationTokenSource? _automaticStartCancellation;
     private bool _closePending;
@@ -39,6 +39,8 @@ internal sealed class MainForm : Form
     private bool _startStopActionPending;
     private bool _automaticStartSuppressed;
     private CancellationTokenSource? _remoteUpdateCancellation;
+    private CancellationTokenSource? _coreUpdateCancellation;
+    private bool UpdatePending => _remoteUpdateCancellation is not null || _coreUpdateCancellation is not null;
 
     public MainForm(
         SingBootApp app,
@@ -46,8 +48,9 @@ internal sealed class MainForm : Form
         bool waitForDefaultGatewayBeforeStart)
     {
         _app = app;
-        _startCoreAfterLaunch = startCoreAfterLaunch;
         _waitForDefaultGatewayBeforeStart = waitForDefaultGatewayBeforeStart;
+        if (startCoreAfterLaunch)
+            _automaticStartCancellation = new CancellationTokenSource();
 
         // Load icons from embedded resources
         _iconRunning = LoadEmbeddedIcon("icon.ico");
@@ -56,6 +59,7 @@ internal sealed class MainForm : Form
         // Build context menu
         _miStartStop = new ToolStripMenuItem("Start", null, OnStartStopClick);
         _miUpdateConfig = new ToolStripMenuItem("Update config", null, OnUpdateConfigClick);
+        _miUpdateCore = new ToolStripMenuItem("Update sing-box", null, OnUpdateCoreClick);
         _miAutoStart = new ToolStripMenuItem("Auto-start")
         {
             CheckOnClick = true,
@@ -68,6 +72,7 @@ internal sealed class MainForm : Form
         var menu = new ContextMenuStrip();
         menu.Items.Add(_miStartStop);
         menu.Items.Add(_miUpdateConfig);
+        menu.Items.Add(_miUpdateCore);
         menu.Items.Add(_miAutoStart);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(miQuit);
@@ -98,23 +103,28 @@ internal sealed class MainForm : Form
     {
         base.OnLoad(e);
 
-        if (_startCoreAfterLaunch)
-            BeginInvoke((Action)StartCoreAfterLaunch);
+        if (_automaticStartCancellation is { } cancellation)
+            BeginInvoke((Action)(() => StartCoreAfterLaunch(cancellation)));
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
-        if (_closePending)
+        if (!_closePending)
         {
-            // Already shutting down — allow close
+            _closePending = true;
+            CancelPendingAutomaticStart();
+            CancelPendingRemoteConfigUpdate();
+            _coreUpdateCancellation?.Cancel();
+            ShowOnlyQuitInTray();
+        }
+        if (_coreUpdateCancellation is not null && !_systemExitPending && e.CloseReason != CloseReason.WindowsShutDown)
+        {
+            // Finish restoring files and removing the staged package before a manual quit.
+            e.Cancel = true;
             base.OnFormClosing(e);
             return;
         }
 
-        _closePending = true;
-        CancelPendingAutomaticStart();
-        CancelPendingRemoteConfigUpdate();
-        ShowOnlyQuitInTray();
         PrepareExitState(isSystemExit: _systemExitPending || e.CloseReason == CloseReason.WindowsShutDown,
             isManualQuit: _manualQuitRequested);
 
@@ -143,6 +153,7 @@ internal sealed class MainForm : Form
 
     private void HandleCoreEvent(CoreEvent evt)
     {
+        if (_closePending) return;
         if (InvokeRequired)
         {
             BeginInvoke(() => HandleCoreEvent(evt));
@@ -179,6 +190,43 @@ internal sealed class MainForm : Form
     {
         if (_closePending) return;
         BeginUpdateRemoteConfig();
+    }
+
+    private async void OnUpdateCoreClick(object? sender, EventArgs e)
+    {
+        if (_closePending || _automaticStartCancellation is not null ||
+            !CanBeginUpdate(_app.State, _startStopActionPending, UpdatePending))
+            return;
+
+        using var cancellation = new CancellationTokenSource();
+        _coreUpdateCancellation = cancellation;
+        UpdateUI(_app.State);
+        try
+        {
+            AppLog.Write("core update: checking the latest stable sing-box release");
+            var message = await _app.UpdateCoreAsync(cancellation.Token);
+            AppLog.Write($"core update: {message}");
+            if (!_closePending)
+                ShowBalloon(message, "Update sing-box", ToolTipIcon.Info);
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            AppLog.Write("core update cancelled");
+        }
+        catch (Exception ex)
+        {
+            AppLog.Write($"core update failed: {AppLog.DescribeException(ex)}");
+            if (!_closePending)
+                ShowBalloon(AppLog.RedactUrls(ex.Message), "Update sing-box", ToolTipIcon.Warning);
+        }
+        finally
+        {
+            _coreUpdateCancellation = null;
+            if (!_closePending)
+                UpdateUI(_app.State);
+            else if (!IsDisposed)
+                Close();
+        }
     }
 
     private void OnTrayClick(object? sender, MouseEventArgs e)
@@ -219,6 +267,7 @@ internal sealed class MainForm : Form
 
     private void ToggleStartStop()
     {
+        if (_coreUpdateCancellation is not null) return;
         CancelPendingAutomaticStart();
 
         switch (GetStartStopAction(_app.State, _startStopActionPending))
@@ -243,10 +292,8 @@ internal sealed class MainForm : Form
         }
     }
 
-    private async void StartCoreAfterLaunch()
+    private async void StartCoreAfterLaunch(CancellationTokenSource cancellation)
     {
-        var cancellation = new CancellationTokenSource();
-        _automaticStartCancellation = cancellation;
         var source = _waitForDefaultGatewayBeforeStart ? "auto-start" : "handoff";
 
         try
@@ -282,6 +329,8 @@ internal sealed class MainForm : Form
                 _automaticStartCancellation = null;
 
             cancellation.Dispose();
+            if (!_closePending)
+                UpdateUI(_app.State);
         }
     }
 
@@ -299,7 +348,7 @@ internal sealed class MainForm : Form
     private async void BeginUpdateRemoteConfig()
     {
         if (_closePending ||
-            !CanUpdateConfig(_app.State, _startStopActionPending, isUpdatingConfig: _remoteUpdateCancellation is not null))
+            !CanBeginUpdate(_app.State, _startStopActionPending, UpdatePending))
         {
             return;
         }
@@ -484,11 +533,14 @@ internal sealed class MainForm : Form
         _trayIcon.Text = _app.TrayText;
         _trayIcon.Icon = running ? _iconRunning : _iconStopped;
         _miStartStop.Text = running ? "Stop" : "Start";
-        _miStartStop.Enabled = !_startStopActionPending &&
+        _miStartStop.Enabled = _coreUpdateCancellation is null && !_startStopActionPending &&
                                state != CoreState.Starting &&
                                state != CoreState.Stopping;
         _miUpdateConfig.Text = isUpdatingConfig ? "Updating config..." : "Update config";
-        _miUpdateConfig.Enabled = CanUpdateConfig(state, _startStopActionPending, isUpdatingConfig);
+        var canUpdate = CanBeginUpdate(state, _startStopActionPending, UpdatePending);
+        _miUpdateConfig.Enabled = canUpdate;
+        _miUpdateCore.Text = _coreUpdateCancellation is null ? "Update sing-box" : "Updating sing-box...";
+        _miUpdateCore.Enabled = canUpdate && _automaticStartCancellation is null;
     }
 
     private void ShowBalloon(string text, string title, ToolTipIcon icon, int timeoutMs = 10000)
@@ -546,13 +598,13 @@ internal sealed class MainForm : Form
         return !isSystemExit && isManualQuit;
     }
 
-    internal static bool CanUpdateConfig(
+    internal static bool CanBeginUpdate(
         CoreState state,
         bool startStopActionPending,
-        bool isUpdatingConfig)
+        bool updatePending)
     {
         return !startStopActionPending &&
-               !isUpdatingConfig &&
+               !updatePending &&
                state is CoreState.Running or CoreState.Stopped or CoreState.Failed;
     }
 

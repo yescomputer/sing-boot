@@ -10,6 +10,7 @@ Windows 系统托盘工具，用于在后台运行和管理 [sing-box](https://g
 - 左键点击或右键菜单控制启动/停止
 - 开机自启动
 - 自动识别同目录 sing-box 部署
+- 右键选择「Update sing-box」可更新到官方最新稳定版
 - 支持在托盘右键菜单从远程地址拉取新配置、自动备份原 `config.json`，并在核心运行时自动重启
 - 自动保存核心 stdout 和 stderr 到 `logs/` 目录
 
@@ -30,6 +31,14 @@ sing-boot.json    # 可选：远程配置拉取设置
 ```
 
 sing-box 仍使用 `sing-box run -c stdin`，程序会读取并规范化同目录 `config.json` 后通过 stdin 传给核心。JSONC 支持注释和对象、数组内的尾随逗号；其他非法 JSON 会被拒绝，不会被自动改写。
+
+### 从托盘更新 sing-box
+
+右键点击托盘图标，选择 **Update sing-box**。程序会查询 [sing-box 官方稳定版](https://github.com/SagerNet/sing-box/releases/latest)，选择标准 Windows x64 压缩包。已有相同稳定版或更高版本时，托盘会提示当前版本并跳过下载。首次安装也可使用这个菜单。
+
+程序先下载并校验压缩包的 SHA-256，再运行新文件的 `version` 命令核对版本。校验通过后，程序替换同目录的 `sing-box.exe` 和包内附带的 `libcronet.dll`，将原文件备份为同名的 `.bak` 文件。
+
+核心原来在运行时，程序会用更新前的配置重启核心。若替换失败或新版启动失败，程序会尝试恢复原文件并重新启动旧版。核心原来已停止时，只更新文件。`config.json` 和远程配置设置均可继续使用。
 
 ## 配置
 

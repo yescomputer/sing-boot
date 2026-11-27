@@ -55,15 +55,15 @@ public sealed class MainFormStateTests
     }
 
     [TestMethod]
-    public void CanUpdateConfig_AllowsOnlyStableStatesWithoutPendingOperations()
+    public void CanBeginUpdate_AllowsOnlyStableStatesWithoutPendingOperations()
     {
-        Assert.IsTrue(MainForm.CanUpdateConfig(CoreState.Running, startStopActionPending: false, isUpdatingConfig: false));
-        Assert.IsTrue(MainForm.CanUpdateConfig(CoreState.Stopped, startStopActionPending: false, isUpdatingConfig: false));
-        Assert.IsTrue(MainForm.CanUpdateConfig(CoreState.Failed, startStopActionPending: false, isUpdatingConfig: false));
-        Assert.IsFalse(MainForm.CanUpdateConfig(CoreState.Starting, startStopActionPending: false, isUpdatingConfig: false));
-        Assert.IsFalse(MainForm.CanUpdateConfig(CoreState.Stopping, startStopActionPending: false, isUpdatingConfig: false));
-        Assert.IsFalse(MainForm.CanUpdateConfig(CoreState.Running, startStopActionPending: true, isUpdatingConfig: false));
-        Assert.IsFalse(MainForm.CanUpdateConfig(CoreState.Running, startStopActionPending: false, isUpdatingConfig: true));
+        Assert.IsTrue(MainForm.CanBeginUpdate(CoreState.Running, startStopActionPending: false, updatePending: false));
+        Assert.IsTrue(MainForm.CanBeginUpdate(CoreState.Stopped, startStopActionPending: false, updatePending: false));
+        Assert.IsTrue(MainForm.CanBeginUpdate(CoreState.Failed, startStopActionPending: false, updatePending: false));
+        Assert.IsFalse(MainForm.CanBeginUpdate(CoreState.Starting, startStopActionPending: false, updatePending: false));
+        Assert.IsFalse(MainForm.CanBeginUpdate(CoreState.Stopping, startStopActionPending: false, updatePending: false));
+        Assert.IsFalse(MainForm.CanBeginUpdate(CoreState.Running, startStopActionPending: true, updatePending: false));
+        Assert.IsFalse(MainForm.CanBeginUpdate(CoreState.Running, startStopActionPending: false, updatePending: true));
     }
 
     [TestMethod]

@@ -1,7 +1,6 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Http;
-using System.Net.Http.Headers;
 using System.Text;
 
 namespace SingBoot;
@@ -121,17 +120,8 @@ internal static class RemoteConfigUpdater
         TimeSpan timeout,
         CancellationToken cancellationToken)
     {
-        EnsureModernTls();
-
-        var handler = customHandler ?? CreateDefaultHttpHandler();
-        var disposeHandler = customHandler is null;
-
-        using var client = new HttpClient(handler, disposeHandler)
-        {
-            Timeout = Timeout.InfiniteTimeSpan,
-            MaxResponseContentBufferSize = MaxConfigResponseBytes
-        };
-        client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("sing-boot", "1.0"));
+        using var client = UpdateHttpClient.Create(customHandler);
+        client.MaxResponseContentBufferSize = MaxConfigResponseBytes;
 
         using var timeoutCts = new CancellationTokenSource(timeout);
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
@@ -165,30 +155,6 @@ internal static class RemoteConfigUpdater
                 ex);
         }
     }
-
-    private static HttpClientHandler CreateDefaultHttpHandler()
-    {
-        return new HttpClientHandler
-        {
-            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate,
-            UseProxy = true,
-            Proxy = WebRequest.GetSystemWebProxy()
-        };
-    }
-
-#pragma warning disable CA5386 // Ensure TLS 1.2/1.3 are enabled on .NET Framework 4.8 without app.config
-    private static void EnsureModernTls()
-    {
-        ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
-        try
-        {
-            ServicePointManager.SecurityProtocol |= (SecurityProtocolType)12288;
-        }
-        catch (NotSupportedException)
-        {
-        }
-    }
-#pragma warning restore CA5386
 
     private static void ClearReadOnlyAttributeIfPresent(string path)
     {
